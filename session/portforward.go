@@ -38,6 +38,7 @@ const (
 	portForwardV3MaxFrameSize    = 256 * 1024
 	portForwardV3Window          = 16
 	portForwardV3DefaultFrame    = 7680
+	portForwardUDPDrainTimeout   = 5 * time.Second
 	portForwardConnectionTimeout = time.Second * 600
 
 	// ProtoTypePortForwardV3 is the opt-in, flow-controlled successor to v2.
@@ -62,6 +63,11 @@ type MenderPortForwarder struct {
 	conn           net.Conn
 	frameSize      int
 	udpBatch       bool
+	udpWrites      chan []byte
+	udpRetired     chan struct{} // closed after all terminal output and map removal
+	udpOutputMu    sync.Mutex    // orders outbound UDP data and ACKs before stop
+	drainTimer     *time.Timer   // non-nil once the peer has requested an orderly stop
+	lastUDPWrite   time.Time     // protected by closeMu
 	ctx            context.Context
 	ctxCancel      context.CancelFunc
 	portForwarders map[string]*MenderPortForwarder
@@ -157,23 +163,42 @@ func (f *MenderPortForwarder) writeHalfClose() error {
 }
 
 func (f *MenderPortForwarder) Close(sendStopMessage bool) error {
+	return f.finish(sendStopMessage, nil)
+}
+
+func (f *MenderPortForwarder) finish(sendStopMessage bool, forwardErr error) error {
 	f.closeMu.Lock()
 	if f.closed {
 		f.closeMu.Unlock()
 		return nil
 	}
 	f.closed = true
+	if f.drainTimer != nil {
+		f.drainTimer.Stop()
+	}
 	conn := f.conn
 	cancel := f.ctxCancel
 	mapMutex := f.mapMutex
 	f.closeMu.Unlock()
 
 	log.Debugf("port-forward[%s/%s] close", f.SessionID, f.ConnectionID)
-	if sendStopMessage {
-		f.writeStop()
-	}
 	if cancel != nil {
 		cancel()
+	}
+	var err error
+	if conn != nil {
+		err = conn.Close()
+	}
+	if f.udpBatch {
+		f.udpOutputMu.Lock()
+		defer f.udpOutputMu.Unlock()
+	}
+	if forwardErr != nil {
+		header := ws.ProtoHdr{Proto: f.proto, SessionID: f.SessionID, MsgType: wspf.MessageTypePortForward, Properties: map[string]interface{}{wspf.PropertyConnectionID: f.ConnectionID}}
+		writePortForwardError(header, f.ResponseWriter, forwardErr)
+	}
+	if sendStopMessage {
+		f.writeStop()
 	}
 	if mapMutex != nil {
 		mapMutex.Lock()
@@ -182,10 +207,10 @@ func (f *MenderPortForwarder) Close(sendStopMessage bool) error {
 		}
 		mapMutex.Unlock()
 	}
-	if conn == nil {
-		return nil
+	if f.udpRetired != nil {
+		close(f.udpRetired)
 	}
-	return conn.Close()
+	return err
 }
 
 // targetReadEOF handles EOF on the target's read side. For v3 this is a
@@ -296,12 +321,30 @@ func (f *MenderPortForwarder) Read() {
 	}
 }
 
-// readDatagrams flushes a sparse batch on time and a busy batch on size.
-func (f *MenderPortForwarder) readDatagrams() {
-	defer f.Close(true)
+// Only the reader sets socket deadlines. Uploads refresh the shared activity
+// timestamp without disturbing a short deadline used to assemble a batch.
+func (f *MenderPortForwarder) udpIdleDeadline(lastRead time.Time, idle time.Duration) time.Time {
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	if f.lastUDPWrite.After(lastRead) {
+		return f.lastUDPWrite.Add(idle)
+	}
+	return lastRead.Add(idle)
+}
+
+func (f *MenderPortForwarder) readDatagrams(idle time.Duration) {
+	defer func() {
+		f.closeMu.Lock()
+		draining := f.drainTimer != nil
+		f.closeMu.Unlock()
+		if !draining {
+			_ = f.Close(true)
+		}
+	}()
 	packet := make([]byte, udpMaxDatagram+1)
+	lastRead := time.Now()
 	for f.ctx.Err() == nil {
-		deadline := time.Now().Add(portForwardConnectionTimeout)
+		deadline := f.udpIdleDeadline(lastRead, idle)
 		if f.conn.SetReadDeadline(deadline) != nil {
 			return
 		}
@@ -310,31 +353,137 @@ func (f *MenderPortForwarder) readDatagrams() {
 		for count := 0; count < udpBatchCount && len(body)+udpMaxDatagram+2 <= udpBatchFrame; count++ {
 			n, err := f.conn.Read(packet)
 			if err != nil {
-				if e, ok := err.(net.Error); ok && e.Timeout() && len(body) > 0 {
-					break
+				if e, ok := err.(net.Error); ok && e.Timeout() {
+					if len(body) > 0 || time.Now().Before(f.udpIdleDeadline(lastRead, idle)) {
+						break
+					}
 				}
 				return
 			}
 			if n > udpMaxDatagram {
 				return
 			}
+			lastRead = time.Now()
 			body = appendDatagram(body, packet[:n])
 			if count == 0 {
-				started = time.Now()
+				started = lastRead
 				if f.conn.SetReadDeadline(started.Add(udpBatchDelay)) != nil {
 					return
 				}
 			}
 		}
+		if len(body) == 0 {
+			continue // upload activity extended the deadline during the read
+		}
 		body = finishBatch(body, started)
-		if !f.waitCredit(deadline) {
-			return
+		for !f.waitCredit(f.udpIdleDeadline(lastRead, idle)) {
+			if f.ctx.Err() != nil || !time.Now().Before(f.udpIdleDeadline(lastRead, idle)) {
+				return
+			}
 		}
 		msg := &ws.ProtoMsg{Header: ws.ProtoHdr{Proto: f.proto, MsgType: wspf.MessageTypePortForward, SessionID: f.SessionID, Properties: map[string]interface{}{wspf.PropertyConnectionID: f.ConnectionID}}, Body: body}
-		if err := f.ResponseWriter.WriteProtoMsg(msg); err != nil {
+		if err := f.writeUDPMessage(msg); err != nil {
 			return
 		}
 	}
+}
+
+// A single writer preserves per-flow datagram order while the session keeps
+// dispatching control messages and other connections.
+func (f *MenderPortForwarder) writeDatagrams() {
+	defer f.Close(true)
+	for {
+		select {
+		case <-f.ctx.Done():
+			return
+		case body, ok := <-f.udpWrites:
+			if !ok {
+				return
+			}
+			if err := f.writeUDPBatch(body); err != nil {
+				if f.ctx.Err() == nil {
+					_ = f.finish(true, err)
+				}
+				return
+			}
+		}
+	}
+}
+
+func (f *MenderPortForwarder) writeUDPBatch(body []byte) error {
+	packets, err := splitDatagrams(body)
+	if err != nil {
+		return err
+	}
+	start := time.Now()
+	for i, packet := range packets {
+		paceGroup(start, body, i, len(packets))
+		if err := f.ctx.Err(); err != nil {
+			return err
+		}
+		n, err := f.conn.Write(packet)
+		if err != nil {
+			return err
+		}
+		if n != len(packet) {
+			return io.ErrShortWrite
+		}
+	}
+	f.closeMu.Lock()
+	f.lastUDPWrite = time.Now()
+	f.closeMu.Unlock()
+	return f.writeV3Ack(ResponseWriterFunc(f.writeUDPMessage))
+}
+
+func (f *MenderPortForwarder) writeUDPMessage(msg *ws.ProtoMsg) error {
+	f.udpOutputMu.Lock()
+	defer f.udpOutputMu.Unlock()
+	if err := f.ctx.Err(); err != nil {
+		return err
+	}
+	return f.ResponseWriter.WriteProtoMsg(msg)
+}
+
+// Closing the queue puts the stop after all admitted batches. The timer also
+// interrupts a blocked socket write, without tying up the session dispatcher.
+func (f *MenderPortForwarder) drainUDP(timeout time.Duration) {
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	if f.closed || f.drainTimer != nil {
+		return
+	}
+	f.drainTimer = time.AfterFunc(timeout, func() {
+		_ = f.finish(true, errors.New("timed out draining UDP batches"))
+	})
+	close(f.udpWrites)
+}
+
+func (f *MenderPortForwarder) enqueueUDP(body []byte) error {
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	if f.closed || f.drainTimer != nil {
+		// A terminal message is already on its way for this connection.
+		return nil
+	}
+	if len(body) > udpBatchFrame {
+		return errors.New("UDP batch exceeds negotiated frame size")
+	}
+	select {
+	case f.udpWrites <- body:
+		return nil
+	default:
+		return errors.New("UDP batch exceeds negotiated credit window")
+	}
+}
+
+func (f *MenderPortForwarder) writeV3Ack(w ResponseWriter) error {
+	return w.WriteProtoMsg(&ws.ProtoMsg{
+		Header: ws.ProtoHdr{
+			Proto: f.proto, MsgType: wspf.MessageTypePortForwardAck, SessionID: f.SessionID,
+			Properties: map[string]interface{}{wspf.PropertyConnectionID: f.ConnectionID},
+		},
+		Body: []byte{0, 0, 0, 1},
+	})
 }
 
 func (f *MenderPortForwarder) Write(body []byte) error {
@@ -406,6 +555,10 @@ func (h *PortForwardHandler) Close() error {
 		if err := f.Close(false); err != nil {
 			errs = append(errs, err)
 		}
+		if f.udpRetired != nil {
+			// Another goroutine may already own teardown and its final write.
+			<-f.udpRetired
+		}
 	}
 	if len(errs) > 0 {
 		return errs
@@ -442,30 +595,37 @@ func (h *PortForwardHandler) ServeProtoMsg(msg *ws.ProtoMsg, w ResponseWriter) {
 		err = fmt.Errorf("invalid protocol ID %d in request header", msg.Header.Proto)
 	}
 	if err != nil {
-		log.Errorf("portForwardHandler(%+v)", err)
+		header := msg.Header
+		header.Proto = h.proto
+		writePortForwardError(header, w, err)
+	}
+}
 
-		errMessage := err.Error()
-		body, err := msgpack.Marshal(&wspf.Error{
-			Error:       &errMessage,
-			MessageType: &msg.Header.MsgType,
-		})
-		if err != nil {
-			log.Errorf("portForwardHandler: msgpack.Marshal(%+v)", err)
-		}
-		response := &ws.ProtoMsg{
-			Header: ws.ProtoHdr{
-				Proto:     h.proto,
-				MsgType:   wspf.MessageTypeError,
-				SessionID: msg.Header.SessionID,
-			},
-			Body: body,
-		}
-		if id, ok := msg.Header.Properties[wspf.PropertyConnectionID].(string); ok {
-			response.Header.Properties = map[string]interface{}{wspf.PropertyConnectionID: id}
-		}
-		if err := w.WriteProtoMsg(response); err != nil {
-			log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
-		}
+func writePortForwardError(header ws.ProtoHdr, w ResponseWriter, err error) {
+	log.Errorf("portForwardHandler(%+v)", err)
+
+	errMessage := err.Error()
+	body, err := msgpack.Marshal(&wspf.Error{
+		Error:       &errMessage,
+		MessageType: &header.MsgType,
+	})
+	if err != nil {
+		log.Errorf("portForwardHandler: msgpack.Marshal(%+v)", err)
+		return
+	}
+	response := &ws.ProtoMsg{
+		Header: ws.ProtoHdr{
+			Proto:     header.Proto,
+			MsgType:   wspf.MessageTypeError,
+			SessionID: header.SessionID,
+		},
+		Body: body,
+	}
+	if id, ok := header.Properties[wspf.PropertyConnectionID].(string); ok {
+		response.Header.Properties = map[string]interface{}{wspf.PropertyConnectionID: id}
+	}
+	if err := w.WriteProtoMsg(response); err != nil {
+		log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
 	}
 }
 
@@ -547,11 +707,21 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		*host,
 		*portNumber,
 	)
-	if h.get(connectionID) != nil {
-		return errors.New("connection already exists")
+	if previous := h.get(connectionID); previous != nil {
+		previous.closeMu.Lock()
+		retiring := previous.closed && previous.udpRetired != nil
+		previous.closeMu.Unlock()
+		if !retiring {
+			return errors.New("connection already exists")
+		}
+		<-previous.udpRetired
 	}
 	if h.proto == ProtoTypePortForwardV3 && string(*protocol) != wspf.PortForwardProtocolTCP && !udpBatch {
 		return errors.New("v3 UDP requires negotiated batching and flow control")
+	}
+	if udpBatch {
+		portForwarder.udpWrites = make(chan []byte, portForwardV3Window)
+		portForwarder.udpRetired = make(chan struct{})
 	}
 	err := portForwarder.dial(string(*protocol), *host, *portNumber)
 	if err != nil {
@@ -597,7 +767,8 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		sock := portForwarder.conn.(*net.UDPConn)
 		_ = sock.SetReadBuffer(4 * 1024 * 1024)
 		_ = sock.SetWriteBuffer(4 * 1024 * 1024)
-		go portForwarder.readDatagrams()
+		go portForwarder.writeDatagrams()
+		go portForwarder.readDatagrams(portForwardConnectionTimeout)
 	} else {
 		go portForwarder.Read()
 	}
@@ -613,6 +784,10 @@ func (h *PortForwardHandler) portForwardHandlerStop(message *ws.ProtoMsg, w Resp
 	}
 
 	log.Infof("port-forward: stop %s/%s", message.Header.SessionID, connectionID)
+	if portForwarder.udpBatch {
+		portForwarder.drainUDP(portForwardUDPDrainTimeout)
+		return nil
+	}
 	if err := portForwarder.Close(false); err != nil {
 		return err
 	}
@@ -644,25 +819,16 @@ func (h *PortForwardHandler) portForwardHandlerForward(
 		return errPortForwardUnkonwnConnection
 	}
 
+	if portForwarder.udpBatch {
+		if err := portForwarder.enqueueUDP(message.Body); err != nil {
+			_ = portForwarder.finish(true, err)
+		}
+		return nil
+	}
 	if h.proto == ProtoTypePortForwardV3 && len(message.Body) > portForwarder.frameSize {
 		return errors.New("frame exceeds negotiated TCP frame size")
 	}
-
-	if portForwarder.udpBatch {
-		packets, err := splitDatagrams(message.Body)
-		if err != nil {
-			return err
-		}
-		start := time.Now()
-		for i, pkt := range packets {
-			paceGroup(start, message.Body, i, len(packets))
-			if n, err := portForwarder.conn.Write(pkt); err != nil {
-				return err
-			} else if n != len(pkt) {
-				return io.ErrShortWrite
-			}
-		}
-	} else if err := portForwarder.Write(message.Body); err != nil {
+	if err := portForwarder.Write(message.Body); err != nil {
 		return fmt.Errorf("error forwarding message to connection: %w", err)
 	}
 
@@ -680,21 +846,7 @@ func (h *PortForwardHandler) portForwardHandlerForward(
 			},
 		})
 	case ProtoTypePortForwardV3:
-		// v3 ACKs carry the number of released input credits. The daemon
-		// accepts one frame at a time, so release exactly one credit.
-		body := make([]byte, 4)
-		binary.BigEndian.PutUint32(body, 1)
-		return w.WriteProtoMsg(&ws.ProtoMsg{
-			Header: ws.ProtoHdr{
-				Proto:     message.Header.Proto,
-				MsgType:   wspf.MessageTypePortForwardAck,
-				SessionID: message.Header.SessionID,
-				Properties: map[string]interface{}{
-					wspf.PropertyConnectionID: connectionID,
-				},
-			},
-			Body: body,
-		})
+		return portForwarder.writeV3Ack(w)
 	default:
 		return nil
 	}

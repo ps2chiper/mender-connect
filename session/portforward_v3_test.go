@@ -520,3 +520,300 @@ func TestPortForwardV3UDPNegotiationAndBoundaries(t *testing.T) {
 	}
 	assert.Equal(t, [][]byte{{}, {42}}, got)
 }
+
+// Install a negotiated flow with a controllable target transport. Tests can
+// block a write or shorten its idle interval without changing global timers.
+func startUDPWriter(t *testing.T, h *PortForwardHandler, id string, conn net.Conn) (*MenderPortForwarder, *v3TestWriter) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	w := newV3TestWriter()
+	f := &MenderPortForwarder{proto: h.proto, SessionID: "sid", ConnectionID: id,
+		ResponseWriter: w, conn: conn, ctx: ctx, ctxCancel: cancel, udpBatch: true,
+		udpWrites: make(chan []byte, portForwardV3Window), udpRetired: make(chan struct{}), frameSize: udpBatchFrame,
+		portForwarders: h.portForwarders, mapMutex: &h.mutex}
+	h.mutex.Lock()
+	h.portForwarders[id] = f
+	h.mutex.Unlock()
+	go f.writeDatagrams()
+	t.Cleanup(func() { _ = f.Close(false) })
+	return f, w
+}
+
+func sendTestDatagram(h *PortForwardHandler, f *MenderPortForwarder, data byte) {
+	msg := &ws.ProtoMsg{Header: ws.ProtoHdr{Proto: h.proto, MsgType: wspf.MessageTypePortForward,
+		SessionID: f.SessionID, Properties: map[string]interface{}{wspf.PropertyConnectionID: f.ConnectionID}},
+		Body: appendDatagram(nil, []byte{data})}
+	h.ServeProtoMsg(msg, f.ResponseWriter)
+}
+
+func TestV3UDPBlockedAndFailedWriteIsolatedToFlow(t *testing.T) {
+	h := PortForwardV3()().(*PortForwardHandler)
+	blocked, sink := net.Pipe()
+	defer sink.Close()
+	f, writer := startUDPWriter(t, h, "slow", blocked)
+	healthy, target := net.Pipe()
+	defer target.Close()
+	good, goodWriter := startUDPWriter(t, h, "healthy", healthy)
+	dispatched := make(chan struct{})
+	go func() {
+		sendTestDatagram(h, f, 1)
+		sendTestDatagram(h, good, 2)
+		close(dispatched)
+	}()
+	select {
+	case <-dispatched:
+	case <-time.After(time.Second):
+		t.Fatal("one target blocked the session dispatcher")
+	}
+	var pkt [1]byte
+	_ = target.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(target, pkt[:]); err != nil || pkt[0] != 2 {
+		t.Fatal(pkt, err)
+	}
+	if ack := goodWriter.take(t, 1)[0]; ack.Header.MsgType != "ack" {
+		t.Fatal(ack.Header)
+	}
+	select {
+	case m := <-writer.created:
+		t.Fatalf("confirmed blocked write: %s", m.Header.MsgType)
+	default:
+	}
+	// Closing the pipe makes the pending target write fail.
+	sink.Close()
+	requireUDPFailure(t, writer, f.ConnectionID, io.ErrClosedPipe.Error())
+	awaitUDPRetirement(t, f)
+	if h.get(f.ConnectionID) != nil {
+		t.Fatal("failed flow still registered")
+	}
+	// Reopen the same mapping and verify that it can deliver and earn credit.
+	replacement, peer := net.Pipe()
+	defer peer.Close()
+	retry, retryWriter := startUDPWriter(t, h, "slow", replacement)
+	sendTestDatagram(h, retry, 3)
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(peer, pkt[:]); err != nil || pkt[0] != 3 {
+		t.Fatal(pkt, err)
+	}
+	if ack := retryWriter.take(t, 1)[0]; ack.Header.MsgType != "ack" {
+		t.Fatal(ack.Header)
+	}
+}
+
+func TestV3UDPOneWayUploadRefreshesIdleDeadline(t *testing.T) {
+	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	sock, err := net.DialUDP("udp4", nil, target.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := PortForwardV3()().(*PortForwardHandler)
+	f, w := startUDPWriter(t, h, "upload", sock)
+	const idle = 200 * time.Millisecond
+	go f.readDatagrams(idle)
+	// The target receives the stream and never replies.
+	until := time.Now().Add(3 * idle)
+	for time.Now().Before(until) {
+		sendTestDatagram(h, f, 42)
+		if ack := w.take(t, 1)[0]; ack.Header.MsgType != "ack" {
+			t.Fatal(ack.Header)
+		}
+		var buf [1]byte
+		_ = target.SetReadDeadline(time.Now().Add(time.Second))
+		if _, _, err := target.ReadFromUDP(buf[:]); err != nil || buf[0] != 42 {
+			t.Fatal(buf, err)
+		}
+		time.Sleep(idle / 8)
+	}
+	if stop := w.take(t, 1)[0]; stop.Header.MsgType != "stop" {
+		t.Fatal(stop.Header)
+	}
+	awaitUDPRetirement(t, f)
+	if h.get(f.ConnectionID) != nil {
+		t.Fatal("idle flow still registered")
+	}
+}
+
+func awaitUDPRetirement(t *testing.T, f *MenderPortForwarder) {
+	t.Helper()
+	select {
+	case <-f.udpRetired:
+	case <-time.After(time.Second):
+		t.Fatal("flow did not retire")
+	}
+}
+
+func requireUDPFailure(t *testing.T, w *v3TestWriter, id, reason string) {
+	t.Helper()
+	msgs := w.take(t, 2)
+	var detail wspf.Error
+	if msgs[0].Header.MsgType != "error" || msgs[0].Header.Properties[wspf.PropertyConnectionID] != id ||
+		msgpack.Unmarshal(msgs[0].Body, &detail) != nil || detail.MessageType == nil || *detail.MessageType != "forward" ||
+		detail.Error == nil || *detail.Error != reason {
+		t.Fatalf("unexpected forward error: %+v %+v", msgs[0].Header, detail)
+	}
+	if msgs[1].Header.MsgType != "stop" || msgs[1].Header.Properties[wspf.PropertyConnectionID] != id {
+		t.Fatalf("expected correlated stop, got %+v", msgs[1].Header)
+	}
+}
+
+func udpControl(id, kind string) *ws.ProtoMsg {
+	return &ws.ProtoMsg{Header: ws.ProtoHdr{Proto: ProtoTypePortForwardV3, SessionID: "sid", MsgType: kind,
+		Properties: map[string]interface{}{wspf.PropertyConnectionID: id}}}
+}
+
+func TestV3UDPOrderlyStopDrainsPendingWrites(t *testing.T) {
+	h := PortForwardV3()().(*PortForwardHandler)
+	sock, target := net.Pipe()
+	defer target.Close()
+	f, w := startUDPWriter(t, h, "drain", sock)
+	// No pipe reader yet: both batches are admitted before either can be ACKed.
+	sendTestDatagram(h, f, 1)
+	sendTestDatagram(h, f, 2)
+	h.ServeProtoMsg(udpControl(f.ConnectionID, "stop"), w)
+	h.ServeProtoMsg(udpControl(f.ConnectionID, "stop"), w)
+	if h.get(f.ConnectionID) != f {
+		t.Fatal("lost flow during drain")
+	}
+	_ = target.SetReadDeadline(time.Now().Add(time.Second))
+	var got [2]byte
+	if _, err := io.ReadFull(target, got[:]); err != nil || got != [2]byte{1, 2} {
+		t.Fatal(got, err)
+	}
+	for _, kind := range []string{"ack", "ack", "stop"} {
+		if m := w.take(t, 1)[0]; m.Header.MsgType != kind {
+			t.Fatalf("wanted %s, got %s", kind, m.Header.MsgType)
+		}
+	}
+	awaitUDPRetirement(t, f)
+	select {
+	case m := <-w.created:
+		t.Fatal("extra frame", m.Header)
+	default:
+	}
+}
+
+func TestV3UDPDrainTimeoutReportsUndeliveredBatch(t *testing.T) {
+	h := PortForwardV3()().(*PortForwardHandler)
+	sock, target := net.Pipe()
+	defer target.Close()
+	f, w := startUDPWriter(t, h, "timeout", sock)
+	sendTestDatagram(h, f, 3)
+	f.drainUDP(25 * time.Millisecond)
+	requireUDPFailure(t, w, f.ConnectionID, "timed out draining UDP batches")
+	awaitUDPRetirement(t, f)
+}
+
+// Delay the stop publication itself and exercise reuse through the real new handler.
+func TestV3UDPRetryDuringTerminalPublication(t *testing.T) {
+	h := PortForwardV3()().(*PortForwardHandler)
+	defer h.Close()
+	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	req := udpControl("retry", "new")
+	proto := wspf.PortForwardProtocol(wspf.PortForwardProtocolUDP)
+	host, port := "127.0.0.1", uint16(target.LocalAddr().(*net.UDPAddr).Port)
+	req.Body, err = msgpack.Marshal(portForwardNewV3{UDPBatch: true, FlowControl: true, Protocol: &proto, RemoteHost: &host, RemotePort: &port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	w := newV3TestWriter()
+	held := ResponseWriterFunc(func(m *ws.ProtoMsg) error {
+		if m.Header.MsgType == "stop" {
+			close(entered)
+			<-release
+		}
+		return w.WriteProtoMsg(m)
+	})
+	h.ServeProtoMsg(req, held)
+	if w.take(t, 1)[0].Header.MsgType != "new" {
+		t.Fatal("initial open failed")
+	}
+	old := h.get("retry")
+	h.ServeProtoMsg(udpControl("retry", "stop"), held)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("stop missing")
+	}
+	if h.get("retry") != old {
+		t.Fatal("ID released before terminal publication")
+	}
+	retried := make(chan struct{})
+	go func() { h.ServeProtoMsg(req, w); close(retried) }()
+	unblock()
+	select {
+	case <-retried:
+	case <-time.After(time.Second):
+		t.Fatal("retry did not finish")
+	}
+	for _, want := range []string{"stop", "new"} {
+		if got := w.take(t, 1)[0].Header.MsgType; got != want {
+			t.Fatalf("got %s, want %s", got, want)
+		}
+	}
+	if fresh := h.get("retry"); fresh == nil || fresh == old {
+		t.Fatal("missing replacement")
+	}
+}
+
+func TestV3UDPSessionCloseWaitsForTerminalOutput(t *testing.T) {
+	h := PortForwardV3()().(*PortForwardHandler)
+	sock, sink := net.Pipe()
+	defer sink.Close()
+	f, w := startUDPWriter(t, h, "shutdown", sock)
+	publishing, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	f.ResponseWriter = ResponseWriterFunc(func(m *ws.ProtoMsg) error {
+		if m.Header.MsgType == "stop" {
+			close(publishing)
+			<-release
+		}
+		return w.WriteProtoMsg(m)
+	})
+	f.drainUDP(time.Second)
+	select {
+	case <-publishing:
+	case <-time.After(time.Second):
+		t.Fatal("missing stop")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- h.Close() }()
+	select {
+	case <-closed:
+		t.Fatal("session closed during terminal output")
+	case <-time.After(20 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked shutdown")
+	}
+	if h.get("shutdown") != nil {
+		t.Fatal("retired flow retained")
+	}
+	if err := f.writeUDPMessage(udpControl("shutdown", "ack")); err != context.Canceled {
+		t.Fatalf("stale output: %v", err)
+	}
+	if stop := w.take(t, 1)[0]; stop.Header.MsgType != "stop" {
+		t.Fatal(stop.Header)
+	}
+	select {
+	case m := <-w.created:
+		t.Fatal("output after stop", m.Header)
+	default:
+	}
+}
