@@ -16,12 +16,10 @@ package session
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/mendersoftware/go-lib-micro/ws"
 	wspf "github.com/mendersoftware/go-lib-micro/ws/portforward"
@@ -181,69 +179,42 @@ func TestPortForwardHandler(t *testing.T) {
 
 type CloseFunc func() error
 
-func echoTCPServer(t *testing.T) (tcpPort int, close CloseFunc) {
-	// mock echo TCP server
-	tcpPort = getFreeTCPPort()
-	var (
-		conns    []net.Conn
-		listener net.Listener
-	)
-
-	listener, err := net.Listen(wspf.PortForwardProtocolTCP, fmt.Sprintf("localhost:%d", tcpPort))
+func echoTCPServer(t *testing.T) (int, CloseFunc) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("failed to start echoTCPServer: %s", err.Error())
+		t.Fatal(err)
 	}
+	var conns []net.Conn
+	var workers sync.WaitGroup
+	accepted := make(chan struct{})
 	go func() {
+		defer close(accepted)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					panic(err)
-				}
 				return
 			}
-			defer func() {
-				if listener != nil {
-					listener.Close()
+			conns = append(conns, conn)
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				defer conn.Close()
+				if _, err := io.Copy(conn, conn); err != nil && !errors.Is(err, net.ErrClosed) {
+					t.Error(err)
 				}
 			}()
-			go func(conn net.Conn) {
-				conns = append(conns, conn)
-				defer func() {
-					if conn != nil {
-						conn.Close()
-					}
-				}()
-				_, err = io.Copy(conn, conn)
-				if err != nil {
-					if !errors.Is(err, net.ErrClosed) {
-						t.Error(err)
-					}
-					return
-				}
-			}(conn)
 		}
 	}()
-	closeOnce := new(sync.Once)
-	return tcpPort, func() error {
-		var errs Errors
-		closeOnce.Do(func() {
-			if listener != nil {
-				err := listener.Close()
-				if err != nil {
-					errs = append(errs, err)
-				}
-			}
+	var once sync.Once
+	return listener.Addr().(*net.TCPAddr).Port, func() error {
+		once.Do(func() {
+			_ = listener.Close()
+			<-accepted
 			for _, conn := range conns {
-				err := conn.Close()
-				if err != nil && !errors.Is(err, net.ErrClosed) {
-					errs = append(errs, err)
-				}
+				_ = conn.Close()
 			}
+			workers.Wait()
 		})
-		if len(errs) > 0 {
-			return errs
-		}
 		return nil
 	}
 }
@@ -252,7 +223,8 @@ func TestPortForwardHandlerSuccessfulConnection(t *testing.T) {
 	handler := PortForward()()
 
 	tcpPort, closeTCPServer := echoTCPServer(t)
-	time.Sleep(2000 * time.Millisecond)
+	defer closeTCPServer()
+	defer handler.Close()
 
 	// c1: new
 	protocol := wspf.PortForwardProtocol(wspf.PortForwardProtocolTCP)
@@ -275,15 +247,12 @@ func TestPortForwardHandlerSuccessfulConnection(t *testing.T) {
 		},
 		Body: body,
 	}
-	w := new(testWriter)
+	w := newV3TestWriter()
 	handler.ServeProtoMsg(msg, w)
 
-	time.Sleep(200 * time.Millisecond)
-	if !assert.Len(t, w.Messages, 1) {
-		t.FailNow()
-	}
+	messages := w.take(t, 1)
 
-	rsp := w.Messages[0]
+	rsp := messages[0]
 	assert.Equal(t, ws.ProtoTypePortForward, rsp.Header.Proto)
 	assert.Equal(t, wspf.MessageTypePortForwardNew, rsp.Header.MsgType)
 	assert.Nil(t, rsp.Body)
@@ -300,15 +269,11 @@ func TestPortForwardHandlerSuccessfulConnection(t *testing.T) {
 		},
 		Body: []byte("abcdefghi"),
 	}
-	w.Messages = []*ws.ProtoMsg{}
 	handler.ServeProtoMsg(msg, w)
 
-	time.Sleep(200 * time.Millisecond)
-	if !assert.Len(t, w.Messages, 2) {
-		t.FailNow()
-	}
+	messages = w.take(t, 2)
 
-	for _, rsp := range w.Messages {
+	for _, rsp := range messages {
 		if rsp.Header.MsgType == wspf.MessageTypePortForwardAck {
 			assert.Equal(t, ws.ProtoTypePortForward, rsp.Header.Proto)
 			assert.Equal(t, wspf.MessageTypePortForwardAck, rsp.Header.MsgType)
@@ -356,15 +321,11 @@ func TestPortForwardHandlerSuccessfulConnection(t *testing.T) {
 		},
 		Body: body,
 	}
-	w.Messages = []*ws.ProtoMsg{}
 	handler.ServeProtoMsg(msg, w)
 
-	time.Sleep(200 * time.Millisecond)
-	if !assert.Len(t, w.Messages, 1) {
-		t.FailNow()
-	}
+	messages = w.take(t, 1)
 
-	rsp = w.Messages[0]
+	rsp = messages[0]
 	assert.Equal(t, ws.ProtoTypePortForward, rsp.Header.Proto)
 	assert.Equal(t, wspf.MessageTypePortForwardNew, rsp.Header.MsgType)
 	assert.Equal(t, "session", rsp.Header.SessionID)
@@ -383,15 +344,11 @@ func TestPortForwardHandlerSuccessfulConnection(t *testing.T) {
 		},
 		Body: []byte("1234"),
 	}
-	w.Messages = []*ws.ProtoMsg{}
 	handler.ServeProtoMsg(msg, w)
 
-	time.Sleep(200 * time.Millisecond)
-	if !assert.Len(t, w.Messages, 2) {
-		t.FailNow()
-	}
+	messages = w.take(t, 2)
 
-	for _, rsp := range w.Messages {
+	for _, rsp := range messages {
 		if rsp.Header.MsgType == wspf.MessageTypePortForwardAck {
 			assert.Equal(t, ws.ProtoTypePortForward, rsp.Header.Proto)
 			assert.Equal(t, wspf.MessageTypePortForwardAck, rsp.Header.MsgType)
@@ -429,15 +386,11 @@ func TestPortForwardHandlerSuccessfulConnection(t *testing.T) {
 			},
 		},
 	}
-	w.Messages = []*ws.ProtoMsg{}
 	handler.ServeProtoMsg(msg, w)
 
-	time.Sleep(200 * time.Millisecond)
-	if !assert.Len(t, w.Messages, 1) {
-		t.FailNow()
-	}
+	messages = w.take(t, 1)
 
-	rsp = w.Messages[0]
+	rsp = messages[0]
 	assert.Equal(t, ws.ProtoTypePortForward, rsp.Header.Proto)
 	assert.Equal(t, wspf.MessageTypePortForwardStop, rsp.Header.MsgType)
 	assert.Equal(t, "session", rsp.Header.SessionID)
@@ -456,17 +409,13 @@ func TestPortForwardHandlerSuccessfulConnection(t *testing.T) {
 		},
 		Body: []byte("stop"),
 	}
-	w.Messages = []*ws.ProtoMsg{}
 	handler.ServeProtoMsg(msg, w)
-	time.Sleep(100 * time.Millisecond)
+	messages = w.take(t, 2)
 	assert.NoError(t, closeTCPServer())
 
-	time.Sleep(100 * time.Millisecond)
-	if !assert.Len(t, w.Messages, 3) {
-		t.FailNow()
-	}
+	messages = append(messages, w.take(t, 1)...)
 
-	for _, rsp := range w.Messages {
+	for _, rsp := range messages {
 		if rsp.Header.MsgType == wspf.MessageTypePortForwardAck {
 			assert.Equal(t, ws.ProtoTypePortForward, rsp.Header.Proto)
 			assert.Equal(t, wspf.MessageTypePortForwardAck, rsp.Header.MsgType)
@@ -515,7 +464,7 @@ func TestPortForwardHandlerV2(t *testing.T) {
 	tcpPort, closeTCPServer := echoTCPServer(t)
 	defer closeTCPServer()
 
-	w := NewTestWriter(nil)
+	w := newV3TestWriter()
 	_ = t.Run("new session", func(t *testing.T) {
 		body, _ := msgpack.Marshal(portForwardNew(wspf.PortForwardProtocolTCP, "localhost", uint16(tcpPort)))
 		handler.ServeProtoMsg(&ws.ProtoMsg{
@@ -529,18 +478,12 @@ func TestPortForwardHandlerV2(t *testing.T) {
 			},
 			Body: body,
 		}, w)
-		select {
-		case <-w.Called:
-		case <-time.After(time.Second):
-			t.Error("timeout waiting for response")
-			t.FailNow()
-		}
-		_ = assert.Len(t, w.Messages, 1) &&
-			assert.Equal(t, ws.ProtoTypePortForwardV2, w.Messages[0].Header.Proto) &&
-			assert.Equal(t, wspf.MessageTypePortForwardNew, w.Messages[0].Header.MsgType)
-		assert.Nil(t, w.Messages[0].Body)
+		messages := w.take(t, 1)
+		_ = assert.Len(t, messages, 1) &&
+			assert.Equal(t, ws.ProtoTypePortForwardV2, messages[0].Header.Proto) &&
+			assert.Equal(t, wspf.MessageTypePortForwardNew, messages[0].Header.MsgType)
+		assert.Nil(t, messages[0].Body)
 	}) && t.Run("forward message to session", func(t *testing.T) {
-		w.Messages = nil
 		body := []byte("test data")
 		handler.ServeProtoMsg(&ws.ProtoMsg{
 			Header: ws.ProtoHdr{
@@ -553,18 +496,12 @@ func TestPortForwardHandlerV2(t *testing.T) {
 			},
 			Body: body,
 		}, w)
-		select {
-		case <-w.Called:
-		case <-time.After(time.Second * 2):
-			t.Error("timeout waiting for response")
-			t.FailNow()
-		}
-		_ = assert.Len(t, w.Messages, 1) &&
-			assert.Equal(t, ws.ProtoTypePortForwardV2, w.Messages[0].Header.Proto) &&
-			assert.Equal(t, wspf.MessageTypePortForward, w.Messages[0].Header.MsgType) &&
-			assert.Equal(t, []byte("test data"), w.Messages[0].Body)
+		messages := w.take(t, 1)
+		_ = assert.Len(t, messages, 1) &&
+			assert.Equal(t, ws.ProtoTypePortForwardV2, messages[0].Header.Proto) &&
+			assert.Equal(t, wspf.MessageTypePortForward, messages[0].Header.MsgType) &&
+			assert.Equal(t, []byte("test data"), messages[0].Body)
 	}) && t.Run("error/invalid connection ID", func(t *testing.T) {
-		w.Messages = nil
 		body := []byte("test data")
 		handler.ServeProtoMsg(&ws.ProtoMsg{
 			Header: ws.ProtoHdr{
@@ -577,31 +514,15 @@ func TestPortForwardHandlerV2(t *testing.T) {
 			},
 			Body: body,
 		}, w)
-		select {
-		case <-w.Called:
-		case <-time.After(time.Second):
-			t.Error("timeout waiting for response")
-			t.FailNow()
-		}
-		_ = assert.Len(t, w.Messages, 1) &&
-			assert.Equal(t, ws.ProtoTypePortForwardV2, w.Messages[0].Header.Proto) &&
-			assert.Equal(t, wspf.MessageTypeError, w.Messages[0].Header.MsgType)
+		messages := w.take(t, 1)
+		_ = assert.Len(t, messages, 1) &&
+			assert.Equal(t, ws.ProtoTypePortForwardV2, messages[0].Header.Proto) &&
+			assert.Equal(t, wspf.MessageTypeError, messages[0].Header.MsgType)
 	}) && t.Run("close connection sends stop", func(t *testing.T) {
-		w.Messages = nil
-		select {
-		case <-w.Called:
-		// Make sure the channel is cleared first
-		default:
-		}
 		assert.NoError(t, closeTCPServer(), "error closing connections")
-		select {
-		case <-w.Called:
-		case <-time.After(time.Second):
-			t.Error("timeout waiting for response")
-			t.FailNow()
-		}
-		_ = assert.Len(t, w.Messages, 1) &&
-			assert.Equal(t, ws.ProtoTypePortForwardV2, w.Messages[0].Header.Proto) &&
-			assert.Equal(t, wspf.MessageTypePortForwardStop, w.Messages[0].Header.MsgType)
+		messages := w.take(t, 1)
+		_ = assert.Len(t, messages, 1) &&
+			assert.Equal(t, ws.ProtoTypePortForwardV2, messages[0].Header.Proto) &&
+			assert.Equal(t, wspf.MessageTypePortForwardStop, messages[0].Header.MsgType)
 	})
 }

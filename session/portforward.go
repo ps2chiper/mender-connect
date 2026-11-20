@@ -15,6 +15,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -36,6 +37,7 @@ const (
 	portForwardV3FrameSize       = 256 * 1024
 	portForwardV3MaxFrameSize    = 256 * 1024
 	portForwardV3Window          = 16
+	portForwardV3DefaultFrame    = 7680
 	portForwardConnectionTimeout = time.Second * 600
 
 	// ProtoTypePortForwardV3 is the opt-in, flow-controlled successor to v2.
@@ -61,7 +63,6 @@ type MenderPortForwarder struct {
 	frameSize      int
 	ctx            context.Context
 	ctxCancel      context.CancelFunc
-	mutexAck       *sync.Mutex
 	portForwarders map[string]*MenderPortForwarder
 	mapMutex       *sync.Mutex
 	credits        chan struct{}
@@ -73,6 +74,14 @@ type MenderPortForwarder struct {
 }
 
 func (f *MenderPortForwarder) Connect(protocol string, host string, portNumber uint16) error {
+	if err := f.dial(protocol, host, portNumber); err != nil {
+		return err
+	}
+	go f.Read()
+	return nil
+}
+
+func (f *MenderPortForwarder) dial(protocol string, host string, portNumber uint16) error {
 	log.Debugf(
 		"port-forward[%s/%s] connect: %s/%s:%d",
 		f.SessionID,
@@ -95,9 +104,16 @@ func (f *MenderPortForwarder) Connect(protocol string, host string, portNumber u
 	if f.frameSize <= 0 {
 		f.frameSize = portForwardBuffSize
 	}
-	if f.proto == ProtoTypePortForwardV3 {
-		f.credits = make(chan struct{}, portForwardV3Window)
-		for i := 0; i < portForwardV3Window; i++ {
+	window := 0
+	switch f.proto {
+	case ws.ProtoTypePortForward:
+		window = 1
+	case ProtoTypePortForwardV3:
+		window = portForwardV3Window
+	}
+	if window > 0 {
+		f.credits = make(chan struct{}, window)
+		for i := 0; i < window; i++ {
 			f.credits <- struct{}{}
 		}
 	}
@@ -105,8 +121,6 @@ func (f *MenderPortForwarder) Connect(protocol string, host string, portNumber u
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	f.ctx = ctx
 	f.ctxCancel = cancelFunc
-
-	go f.Read()
 
 	return nil
 }
@@ -162,7 +176,9 @@ func (f *MenderPortForwarder) Close(sendStopMessage bool) error {
 	}
 	if mapMutex != nil {
 		mapMutex.Lock()
-		delete(f.portForwarders, f.ConnectionID)
+		if f.portForwarders[f.ConnectionID] == f {
+			delete(f.portForwarders, f.ConnectionID)
+		}
 		mapMutex.Unlock()
 	}
 	if conn == nil {
@@ -175,21 +191,17 @@ func (f *MenderPortForwarder) Close(sendStopMessage bool) error {
 // half-close: the target can no longer send data, but the peer may still send
 // data to the target. Earlier protocols retain their full-close behaviour.
 func (f *MenderPortForwarder) targetReadEOF() {
-	f.closeMu.Lock()
-	if f.closed {
-		f.closeMu.Unlock()
+	// The read loop calls this once. Publish EOF before allowing the peer's
+	// half-close to retire this connection.
+	if err := f.writeHalfClose(); err != nil {
+		log.Errorf("port-forward[%s/%s] half-close: %v", f.SessionID, f.ConnectionID, err)
+		_ = f.Close(true)
 		return
 	}
-	alreadyClosed := f.targetReadClosed
+	f.closeMu.Lock()
 	f.targetReadClosed = true
 	bothClosed := f.clientReadClosed
 	f.closeMu.Unlock()
-
-	if !alreadyClosed {
-		if err := f.writeHalfClose(); err != nil {
-			log.Errorf("portForwardHandler: half-close: %s", err.Error())
-		}
-	}
 	if bothClosed {
 		_ = f.Close(false)
 	}
@@ -199,109 +211,85 @@ func (f *MenderPortForwarder) targetReadEOF() {
 // leaving the target's read side alive so its response can still be delivered.
 func (f *MenderPortForwarder) ClientHalfClose() error {
 	f.closeMu.Lock()
-	if f.closed {
+	if f.closed || f.clientReadClosed {
 		f.closeMu.Unlock()
 		return nil
 	}
-	if f.clientReadClosed {
+	tcpConn, ok := f.conn.(*net.TCPConn)
+	if !ok {
 		f.closeMu.Unlock()
-		return nil
+		return errors.New("half-close requires a TCP connection")
 	}
-	f.clientReadClosed = true
+	err := tcpConn.CloseWrite()
+	f.clientReadClosed = err == nil
 	bothClosed := f.targetReadClosed
 	f.closeMu.Unlock()
-
-	var err error
-	if tcpConn, ok := f.conn.(*net.TCPConn); ok {
-		err = tcpConn.CloseWrite()
-	} else {
-		err = errors.New("half-close requires a TCP connection")
-	}
-	if bothClosed {
+	if err != nil || bothClosed {
 		_ = f.Close(false)
 	}
 	return err
 }
 
+// waitCredit uses the same idle deadline as the socket. Closing a flow also
+// wakes a sender stalled behind an unacknowledged window.
+func (f *MenderPortForwarder) waitCredit(deadline time.Time) bool {
+	if f.credits == nil {
+		return true
+	}
+	select {
+	case <-f.credits:
+		return true
+	default:
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-f.credits:
+		return true
+	case <-timer.C:
+	case <-f.ctx.Done():
+	}
+	return false
+}
+
 func (f *MenderPortForwarder) Read() {
-	errChan := make(chan error, 1)
-	dataChan := make(chan []byte)
-
-	go func() {
-		data := make([]byte, f.frameSize)
-
-		for {
-			n, err := f.conn.Read(data)
-			if err != nil {
-				select {
-				case errChan <- err:
-				case <-f.ctx.Done():
-				}
-				break
-			}
-			if n > 0 {
-				tmp := make([]byte, n)
-				copy(tmp, data[:n])
-				select {
-				case dataChan <- tmp:
-				case <-f.ctx.Done():
-					return
-				}
-			}
+	buf := make([]byte, f.frameSize)
+	for f.ctx.Err() == nil {
+		deadline := time.Now().Add(portForwardConnectionTimeout)
+		if err := f.conn.SetReadDeadline(deadline); err != nil {
+			_ = f.Close(true)
+			return
 		}
-	}()
-
-	for {
-		select {
-		case err := <-errChan:
-			if f.proto == ProtoTypePortForwardV3 && err == io.EOF {
-				f.targetReadEOF()
+		n, readErr := f.conn.Read(buf)
+		if n > 0 {
+			if !f.waitCredit(deadline) {
+				_ = f.Close(true)
 				return
 			}
-			if err != io.EOF {
-				log.Errorf(
-					"port-forward[%s/%s] error: %v\n",
-					f.SessionID,
-					f.ConnectionID,
-					err.Error(),
-				)
-			}
-			_ = f.Close(true)
-			return
-		case data := <-dataChan:
-			log.Debugf("port-forward[%s/%s] read %d bytes", f.SessionID, f.ConnectionID, len(data))
-
-			if f.proto == ProtoTypePortForwardV3 {
-				select {
-				case <-f.credits:
-				case <-f.ctx.Done():
-					return
-				}
-			}
-
-			if f.proto == ws.ProtoTypePortForward {
-				// Lock the ack mutex: v1 allows only one in-flight message.
-				f.mutexAck.Lock()
-			}
-
 			m := &ws.ProtoMsg{
 				Header: ws.ProtoHdr{
-					Proto:     f.proto,
-					MsgType:   wspf.MessageTypePortForward,
-					SessionID: f.SessionID,
-					Properties: map[string]interface{}{
-						wspf.PropertyConnectionID: f.ConnectionID,
-					},
+					Proto:      f.proto,
+					MsgType:    wspf.MessageTypePortForward,
+					SessionID:  f.SessionID,
+					Properties: map[string]interface{}{wspf.PropertyConnectionID: f.ConnectionID},
 				},
-				Body: data,
+				Body: bytes.Clone(buf[:n]),
 			}
 			if err := f.ResponseWriter.WriteProtoMsg(m); err != nil {
-				log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
+				log.Errorf("port-forward[%s/%s] send: %v", f.SessionID, f.ConnectionID, err)
+				_ = f.Close(true)
+				return
 			}
-		case <-time.After(portForwardConnectionTimeout):
-			_ = f.Close(true)
-			return
-		case <-f.ctx.Done():
+		}
+		if readErr != nil {
+			if f.ctx.Err() != nil {
+				return
+			}
+			if f.proto == ProtoTypePortForwardV3 && readErr == io.EOF {
+				f.targetReadEOF()
+			} else {
+				_ = f.Close(true)
+			}
 			return
 		}
 	}
@@ -323,6 +311,7 @@ func (f *MenderPortForwarder) Write(body []byte) error {
 }
 
 type PortForwardHandler struct {
+	closed         bool
 	portForwarders map[string]*MenderPortForwarder
 	proto          ws.ProtoType
 	mutex          sync.Mutex
@@ -361,14 +350,9 @@ func (h *PortForwardHandler) get(connectionID string) *MenderPortForwarder {
 	return h.portForwarders[connectionID]
 }
 
-func (h *PortForwardHandler) remove(connectionID string) {
-	h.mutex.Lock()
-	delete(h.portForwarders, connectionID)
-	h.mutex.Unlock()
-}
-
 func (h *PortForwardHandler) Close() error {
 	h.mutex.Lock()
+	h.closed = true
 	portForwarders := make([]*MenderPortForwarder, 0, len(h.portForwarders))
 	for _, f := range h.portForwarders {
 		portForwarders = append(portForwarders, f)
@@ -434,6 +418,9 @@ func (h *PortForwardHandler) ServeProtoMsg(msg *ws.ProtoMsg, w ResponseWriter) {
 			},
 			Body: body,
 		}
+		if id, ok := msg.Header.Properties[wspf.PropertyConnectionID].(string); ok {
+			response.Header.Properties = map[string]interface{}{wspf.PropertyConnectionID: id}
+		}
 		if err := w.WriteProtoMsg(response); err != nil {
 			log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
 		}
@@ -450,21 +437,14 @@ type portForwardNewV3 struct {
 }
 
 func v3FrameSize(req *portForwardNewV3) int {
-	if req.TCPMaxFrameSize >= portForwardV3MaxFrameSize ||
-		req.TCPFrameSize >= portForwardV3MaxFrameSize {
-		return portForwardV3FrameSize
+	size := req.TCPMaxFrameSize
+	if size == 0 {
+		size = req.TCPFrameSize
 	}
-	if req.TCPFrameSize > 0 {
-		frameSize := int(req.TCPFrameSize)
-		if frameSize > portForwardV3MaxFrameSize {
-			frameSize = portForwardV3MaxFrameSize
-		}
-		if frameSize < portForwardBuffSize {
-			frameSize = portForwardBuffSize
-		}
-		return frameSize
+	if size == 0 {
+		return portForwardV3DefaultFrame
 	}
-	return portForwardBuffSize
+	return int(min(size, uint32(portForwardV3MaxFrameSize)))
 }
 
 func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w ResponseWriter) error {
@@ -506,14 +486,9 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		ConnectionID:   connectionID,
 		ResponseWriter: w,
 		frameSize:      frameSize,
-		mutexAck:       &sync.Mutex{},
 		portForwarders: h.portForwarders,
 		mapMutex:       &h.mutex,
 	}
-
-	h.mutex.Lock()
-	h.portForwarders[connectionID] = portForwarder
-	h.mutex.Unlock()
 
 	log.Infof(
 		"port-forward: new %s/%s: %s/%s:%d",
@@ -523,11 +498,25 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		*host,
 		*portNumber,
 	)
-	err := portForwarder.Connect(string(*protocol), *host, *portNumber)
+	if h.get(connectionID) != nil {
+		return errors.New("connection already exists")
+	}
+	if h.proto == ProtoTypePortForwardV3 && string(*protocol) != wspf.PortForwardProtocolTCP {
+		return errors.New("v3 port forwarding requires TCP")
+	}
+	err := portForwarder.dial(string(*protocol), *host, *portNumber)
 	if err != nil {
-		h.remove(connectionID)
 		return err
 	}
+
+	h.mutex.Lock()
+	if h.closed || h.portForwarders[connectionID] != nil {
+		h.mutex.Unlock()
+		_ = portForwarder.Close(false)
+		return errors.New("session closed or connection already exists")
+	}
+	h.portForwarders[connectionID] = portForwarder
+	h.mutex.Unlock()
 
 	var responseBody []byte
 	if h.proto == ProtoTypePortForwardV3 {
@@ -550,8 +539,10 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		Body: responseBody,
 	}
 	if err := w.WriteProtoMsg(response); err != nil {
-		log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
+		_ = portForwarder.Close(false)
+		return err
 	}
+	go portForwarder.Read()
 
 	return nil
 }
@@ -564,7 +555,6 @@ func (h *PortForwardHandler) portForwardHandlerStop(message *ws.ProtoMsg, w Resp
 	}
 
 	log.Infof("port-forward: stop %s/%s", message.Header.SessionID, connectionID)
-	h.remove(connectionID)
 	if err := portForwarder.Close(false); err != nil {
 		return err
 	}
@@ -594,6 +584,10 @@ func (h *PortForwardHandler) portForwardHandlerForward(
 	portForwarder := h.get(connectionID)
 	if portForwarder == nil {
 		return errPortForwardUnkonwnConnection
+	}
+
+	if h.proto == ProtoTypePortForwardV3 && len(message.Body) > portForwarder.frameSize {
+		return errors.New("frame exceeds negotiated TCP frame size")
 	}
 
 	if err := portForwarder.Write(message.Body); err != nil {
@@ -638,32 +632,25 @@ func (h *PortForwardHandler) portForwardHandlerAck(message *ws.ProtoMsg, w Respo
 	connectionID, _ := message.Header.Properties[wspf.PropertyConnectionID].(string)
 	portForwarder := h.get(connectionID)
 	if portForwarder == nil {
+		// A batched ACK can arrive after both TCP halves have closed.
+		if h.proto == ProtoTypePortForwardV3 && connectionID != "" {
+			return nil
+		}
 		return errPortForwardUnkonwnConnection
 	}
 
-	if h.proto == ws.ProtoTypePortForward {
-		// Unlock the ack mutex, do not panic if it is not locked.
-		defer func() {
-			if r := recover(); r != nil {
-				log.Errorf("portForwardHandlerAck: recover(%+v)", r)
-			}
-		}()
-		portForwarder.mutexAck.Unlock()
-		return nil
-	}
-	if h.proto == ProtoTypePortForwardV3 {
-		count := 1
-		if len(message.Body) >= 4 {
-			count = int(binary.BigEndian.Uint32(message.Body[:4]))
-			if count > portForwardV3Window {
-				count = portForwardV3Window
-			}
+	count := uint32(1)
+	if h.proto == ProtoTypePortForwardV3 && len(message.Body) != 0 {
+		if len(message.Body) != 4 {
+			return errors.New("invalid v3 ACK length")
 		}
-		for i := 0; i < count; i++ {
-			select {
-			case portForwarder.credits <- struct{}{}:
-			default:
-			}
+		count = min(binary.BigEndian.Uint32(message.Body), uint32(portForwardV3Window))
+	}
+	for i := uint32(0); i < count; i++ {
+		select {
+		case portForwarder.credits <- struct{}{}:
+		default:
+			return nil
 		}
 	}
 	return nil
