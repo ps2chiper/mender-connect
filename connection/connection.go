@@ -51,6 +51,10 @@ func NewConnection(u url.URL,
 
 	var ws *websocket.Conn
 	dialer := *websocket.DefaultDialer
+	// v3 can negotiate 256 KiB TCP frames. Match the CLI's buffers so a
+	// single frame does not get split into many small TLS writes.
+	dialer.ReadBufferSize = 256*1024 + 512
+	dialer.WriteBufferSize = 256*1024 + 512
 
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+token)

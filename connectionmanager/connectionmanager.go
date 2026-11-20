@@ -31,7 +31,9 @@ const (
 	// Time allowed to write a message to the peer.
 	writeWait = 4 * time.Second
 	// Maximum message size allowed from peer.
-	maxMessageSize = 8192
+	// Large v3 port-forward frames are negotiated up to 256 KiB. Leave
+	// generous room for the msgpack envelope around the frame body.
+	maxMessageSize = 512 * 1024
 
 	httpsProtocol = "https"
 	httpProtocol  = "http"
