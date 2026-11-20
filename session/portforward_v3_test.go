@@ -457,3 +457,66 @@ func TestPortForwardV3BulkRoundTrip(t *testing.T) {
 	assert.Equal(t, expected[:], hash.Sum(nil))
 	assert.NoError(t, <-done)
 }
+
+func TestPortForwardV3UDPNegotiationAndBoundaries(t *testing.T) {
+	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	handler := PortForwardV3()()
+	defer handler.Close()
+	writer := newV3TestWriter()
+	req := v3NewRequest(t, "127.0.0.1", uint16(target.LocalAddr().(*net.UDPAddr).Port), "udp:flow")
+	var offer portForwardNewV3
+	if err = msgpack.Unmarshal(req.Body, &offer); err != nil {
+		t.Fatal(err)
+	}
+	proto := wspf.PortForwardProtocol(wspf.PortForwardProtocolUDP)
+	offer.Protocol = &proto
+	offer.UDPBatch = true
+	req.Body, err = msgpack.Marshal(offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.ServeProtoMsg(req, writer)
+	accepted := writer.take(t, 1)[0]
+	var options map[string]bool
+	if err := msgpack.Unmarshal(accepted.Body, &options); err != nil || !options["udp_batch_v1"] {
+		t.Fatal(options, err)
+	}
+	frame := []byte{0, 0, 0, 0, 0, 1, 42}
+	req.Header.MsgType = wspf.MessageTypePortForward
+	req.Body = frame
+	handler.ServeProtoMsg(req, writer)
+	ack := writer.take(t, 1)[0]
+	assert.Equal(t, wspf.MessageTypePortForwardAck, ack.Header.MsgType)
+	assert.Equal(t, []byte{0, 0, 0, 1}, ack.Body)
+	_ = target.SetDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 10)
+	for _, want := range [][]byte{{}, {42}} {
+		n, peer, err := target.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(buf[:n], want) {
+			t.Fatal("UDP boundary changed")
+		}
+		if _, err = target.WriteToUDP(want, peer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got [][]byte
+	for len(got) < 2 {
+		msg := writer.take(t, 1)[0]
+		if msg.Header.MsgType != wspf.MessageTypePortForward {
+			t.Fatal(msg.Header.MsgType)
+		}
+		pkts, err := splitDatagrams(msg.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, pkts...)
+	}
+	assert.Equal(t, [][]byte{{}, {42}}, got)
+}

@@ -61,6 +61,7 @@ type MenderPortForwarder struct {
 	ResponseWriter ResponseWriter
 	conn           net.Conn
 	frameSize      int
+	udpBatch       bool
 	ctx            context.Context
 	ctxCancel      context.CancelFunc
 	portForwarders map[string]*MenderPortForwarder
@@ -295,6 +296,47 @@ func (f *MenderPortForwarder) Read() {
 	}
 }
 
+// readDatagrams flushes a sparse batch on time and a busy batch on size.
+func (f *MenderPortForwarder) readDatagrams() {
+	defer f.Close(true)
+	packet := make([]byte, udpMaxDatagram+1)
+	for f.ctx.Err() == nil {
+		deadline := time.Now().Add(portForwardConnectionTimeout)
+		if f.conn.SetReadDeadline(deadline) != nil {
+			return
+		}
+		var body []byte
+		var started time.Time
+		for count := 0; count < udpBatchCount && len(body)+udpMaxDatagram+2 <= udpBatchFrame; count++ {
+			n, err := f.conn.Read(packet)
+			if err != nil {
+				if e, ok := err.(net.Error); ok && e.Timeout() && len(body) > 0 {
+					break
+				}
+				return
+			}
+			if n > udpMaxDatagram {
+				return
+			}
+			body = appendDatagram(body, packet[:n])
+			if count == 0 {
+				started = time.Now()
+				if f.conn.SetReadDeadline(started.Add(udpBatchDelay)) != nil {
+					return
+				}
+			}
+		}
+		body = finishBatch(body, started)
+		if !f.waitCredit(deadline) {
+			return
+		}
+		msg := &ws.ProtoMsg{Header: ws.ProtoHdr{Proto: f.proto, MsgType: wspf.MessageTypePortForward, SessionID: f.SessionID, Properties: map[string]interface{}{wspf.PropertyConnectionID: f.ConnectionID}}, Body: body}
+		if err := f.ResponseWriter.WriteProtoMsg(msg); err != nil {
+			return
+		}
+	}
+}
+
 func (f *MenderPortForwarder) Write(body []byte) error {
 	log.Debugf("port-forward[%s/%s] write %d bytes", f.SessionID, f.ConnectionID, len(body))
 	for {
@@ -428,6 +470,7 @@ func (h *PortForwardHandler) ServeProtoMsg(msg *ws.ProtoMsg, w ResponseWriter) {
 }
 
 type portForwardNewV3 struct {
+	UDPBatch        bool                      `msgpack:"udp_batch_v1,omitempty"`
 	RemoteHost      *string                   `msgpack:"remote_host"`
 	RemotePort      *uint16                   `msgpack:"remote_port"`
 	Protocol        *wspf.PortForwardProtocol `msgpack:"protocol"`
@@ -452,6 +495,7 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 	var host *string
 	var portNumber *uint16
 	frameSize := portForwardBuffSize
+	udpBatch := false
 
 	if h.proto == ProtoTypePortForwardV3 {
 		req := &portForwardNewV3{}
@@ -462,6 +506,10 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		host = req.RemoteHost
 		portNumber = req.RemotePort
 		frameSize = v3FrameSize(req)
+		udpBatch = req.UDPBatch && req.FlowControl && protocol != nil && string(*protocol) == wspf.PortForwardProtocolUDP
+		if udpBatch {
+			frameSize = udpBatchFrame
+		}
 	} else {
 		req := &wspf.PortForwardNew{}
 		if err := msgpack.Unmarshal(message.Body, req); err != nil {
@@ -486,6 +534,7 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		ConnectionID:   connectionID,
 		ResponseWriter: w,
 		frameSize:      frameSize,
+		udpBatch:       udpBatch,
 		portForwarders: h.portForwarders,
 		mapMutex:       &h.mutex,
 	}
@@ -501,8 +550,8 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 	if h.get(connectionID) != nil {
 		return errors.New("connection already exists")
 	}
-	if h.proto == ProtoTypePortForwardV3 && string(*protocol) != wspf.PortForwardProtocolTCP {
-		return errors.New("v3 port forwarding requires TCP")
+	if h.proto == ProtoTypePortForwardV3 && string(*protocol) != wspf.PortForwardProtocolTCP && !udpBatch {
+		return errors.New("v3 UDP requires negotiated batching and flow control")
 	}
 	err := portForwarder.dial(string(*protocol), *host, *portNumber)
 	if err != nil {
@@ -519,7 +568,9 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 	h.mutex.Unlock()
 
 	var responseBody []byte
-	if h.proto == ProtoTypePortForwardV3 {
+	if udpBatch {
+		responseBody, _ = msgpack.Marshal(map[string]bool{"udp_batch_v1": true})
+	} else if h.proto == ProtoTypePortForwardV3 {
 		responseBody, _ = msgpack.Marshal(&struct {
 			TCPFrameSize uint32 `msgpack:"tcp_frame_size"`
 		}{
@@ -542,7 +593,14 @@ func (h *PortForwardHandler) portForwardHandlerNew(message *ws.ProtoMsg, w Respo
 		_ = portForwarder.Close(false)
 		return err
 	}
-	go portForwarder.Read()
+	if udpBatch {
+		sock := portForwarder.conn.(*net.UDPConn)
+		_ = sock.SetReadBuffer(4 * 1024 * 1024)
+		_ = sock.SetWriteBuffer(4 * 1024 * 1024)
+		go portForwarder.readDatagrams()
+	} else {
+		go portForwarder.Read()
+	}
 
 	return nil
 }
@@ -590,7 +648,21 @@ func (h *PortForwardHandler) portForwardHandlerForward(
 		return errors.New("frame exceeds negotiated TCP frame size")
 	}
 
-	if err := portForwarder.Write(message.Body); err != nil {
+	if portForwarder.udpBatch {
+		packets, err := splitDatagrams(message.Body)
+		if err != nil {
+			return err
+		}
+		start := time.Now()
+		for i, pkt := range packets {
+			paceGroup(start, message.Body, i, len(packets))
+			if n, err := portForwarder.conn.Write(pkt); err != nil {
+				return err
+			} else if n != len(pkt) {
+				return io.ErrShortWrite
+			}
+		}
+	} else if err := portForwarder.Write(message.Body); err != nil {
 		return fmt.Errorf("error forwarding message to connection: %w", err)
 	}
 

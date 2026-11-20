@@ -181,10 +181,12 @@ func (sess *Session) HandleControl(msg *ws.ProtoMsg) (close bool) {
 					protocols[i] = typ
 					i++
 				}
-				rspAccept := ws.Accept{
-					Version:   ws.ProtocolVersion,
-					Protocols: protocols,
-				}
+				_, udpBatch := sess.Routes[ProtoTypePortForwardV3]
+				rspAccept := struct {
+					Version   int            `msgpack:"version"`
+					Protocols []ws.ProtoType `msgpack:"protocols"`
+					UDPBatch  bool           `msgpack:"udp_batch_v1,omitempty"`
+				}{ws.ProtocolVersion, protocols, udpBatch}
 				b, _ := msgpack.Marshal(rspAccept)
 				err := sess.w.WriteProtoMsg(&ws.ProtoMsg{
 					Header: ws.ProtoHdr{
